@@ -155,17 +155,11 @@ private[appinfo] class DefaultInfoService(
     }
 
   private[this] def resolveAppInfos(
-    specs: Seq[RunSpec],
-    embed: Set[AppInfo.Embed],
-    baseData: AppInfoBaseData = newBaseData()): Future[Seq[AppInfo]] = Future.sequence(specs.collect {
-    case app: AppDefinition =>
-      baseData.appInfoFuture(app, embed)
-  })
+    specs: Seq[AppDefinition],
+    embeds: Set[AppInfo.Embed],
+    baseData: AppInfoBaseData = newBaseData()): Future[Seq[AppInfo]] = Future.sequence(specs.map(baseData.appInfoFuture(_, embeds)))
 
   private[this] def resolvePodInfos(
-    specs: Seq[RunSpec],
-    baseData: AppInfoBaseData = newBaseData()): Future[Seq[PodStatus]] = Future.sequence(specs.collect {
-    case pod: PodDefinition =>
-      baseData.podStatus(pod)
-  })
+    specs: Seq[PodDefinition],
+    baseData: AppInfoBaseData = newBaseData()): Future[Seq[PodStatus]] = Future.sequence(specs.map(baseData.podStatus(_)))
 }

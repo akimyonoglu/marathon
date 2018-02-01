@@ -71,92 +71,69 @@ class AppInfoBaseData(
     instanceTracker.instancesBySpec()
   }
 
-  def appInfoFuture(app: AppDefinition, embed: Set[AppInfo.Embed]): Future[AppInfo] = {
-    val appData = new AppData(app)
-    embed.foldLeft(Future.successful(AppInfo(app))) { (infoFuture, embed) =>
-      infoFuture.flatMap { info =>
-        embed match {
-          case AppInfo.Embed.Counts =>
-            appData.taskCountsFuture.map(counts => info.copy(maybeCounts = Some(counts)))
-          case AppInfo.Embed.Readiness =>
-            readinessChecksByAppFuture.map(checks => info.copy(maybeReadinessCheckResults = Some(checks(app.id))))
-          case AppInfo.Embed.Deployments =>
-            runningDeploymentsByAppFuture.map(deployments => info.copy(maybeDeployments = Some(deployments(app.id))))
-          case AppInfo.Embed.LastTaskFailure =>
-            appData.maybeLastTaskFailureFuture.map { maybeLastTaskFailure =>
-              info.copy(maybeLastTaskFailure = maybeLastTaskFailure)
-            }
-          case AppInfo.Embed.Tasks =>
-            appData.enrichedTasksFuture.map(tasks => info.copy(maybeTasks = Some(tasks)))
-          case AppInfo.Embed.TaskStats =>
-            appData.taskStatsFuture.map(taskStats => info.copy(maybeTaskStats = Some(taskStats)))
-        }
-      }
+  def appInfoFuture(app: AppDefinition, embeds: Set[AppInfo.Embed]): Future[AppInfo] = async {
+    val instances = await(instancesByRunSpecFuture).specInstances(app.id).toVector
+    val healthByInstance = await(healthCheckManager.statuses(app.id))
+
+    val appData = new AppData(app, instances, healthByInstance)
+    
+    val checks = await(readinessChecksByAppFuture)
+    val deployments = await(runningDeploymentsByAppFuture)
+    val maybeLastTaskFailure = await(appData.maybeLastTaskFailureFuture)
+
+    var info = AppInfo(app)
+    embeds foreach {
+      case AppInfo.Embed.Counts =>
+        info = info.copy(maybeCounts = Some(appData.taskCounts))
+      case AppInfo.Embed.Readiness =>
+        info = info.copy(maybeReadinessCheckResults = Some(checks(app.id)))
+      case AppInfo.Embed.Deployments =>
+        info = info.copy(maybeDeployments = Some(deployments(app.id)))
+      case AppInfo.Embed.LastTaskFailure =>
+        info = info.copy(maybeLastTaskFailure = maybeLastTaskFailure)
+      case AppInfo.Embed.Tasks =>
+        info = info.copy(maybeTasks = Some(appData.enrichedTasks))
+      case AppInfo.Embed.TaskStats =>
+        info = info.copy(maybeTaskStats = Some(appData.taskStatsByVersion))
     }
+    info
   }
 
   /**
-    * Contains app-sepcific data that we need to retrieved.
+    * Contains app-specific data that we need to retrieved.
     *
     * All data is lazy such that only data that is actually needed for the requested embedded information
     * gets retrieved.
     */
-  private[this] class AppData(app: AppDefinition) {
+  private[this] class AppData(app: AppDefinition, instances: Vector[Instance], healthByInstance: Map[Instance.Id, Seq[Health]]) {
     lazy val now: Timestamp = clock.now()
 
-    lazy val instancesByIdFuture: Future[Map[Instance.Id, Instance]] = instancesByRunSpecFuture.map(_.specInstances(app.id)
-      .foldLeft(Map.newBuilder[Instance.Id, Instance]) { (result, instance) => result += instance.instanceId -> instance }
-      .result()
-    )
+    lazy val tasksForStats: Seq[TaskForStatistics] = {
 
-    lazy val instancesFuture: Future[Seq[Instance]] = instancesByIdFuture.map(_.values.to[Seq])
-
-    lazy val healthByInstanceIdFuture: Future[Map[Instance.Id, Seq[Health]]] = {
-      log.debug(s"retrieving health counts for app [${app.id}]")
-      healthCheckManager.statuses(app.id)
-    }.recover {
-      case NonFatal(e) => throw new RuntimeException(s"while retrieving health counts for app [${app.id}]", e)
+      TaskForStatistics.forInstances(now, instances, healthByInstance)
+      //case NonFatal(e) => throw new RuntimeException(s"while calculating tasksForStats for app [${app.id}]", e)
     }
 
-    lazy val tasksForStats: Future[Seq[TaskForStatistics]] = {
-      for {
-        instances <- instancesFuture
-        healthCounts <- healthByInstanceIdFuture
-      } yield TaskForStatistics.forInstances(now, instances, healthCounts)
-    }.recover {
-      case NonFatal(e) => throw new RuntimeException(s"while calculating tasksForStats for app [${app.id}]", e)
-    }
-
-    lazy val taskCountsFuture: Future[TaskCounts] = {
+    lazy val taskCounts: TaskCounts = {
       log.debug(s"calculating task counts for app [${app.id}]")
-      for {
-        tasks <- tasksForStats
-      } yield TaskCounts(tasks)
-    }.recover {
-      case NonFatal(e) => throw new RuntimeException(s"while calculating task counts for app [${app.id}]", e)
+      TaskCounts(tasksForStats)
+      //case NonFatal(e) => throw new RuntimeException(s"while calculating task counts for app [${app.id}]", e)
     }
 
-    lazy val taskStatsFuture: Future[TaskStatsByVersion] = {
+    lazy val taskStatsByVersion: TaskStatsByVersion = {
       log.debug(s"calculating task stats for app [${app.id}]")
-      for {
-        tasks <- tasksForStats
-      } yield TaskStatsByVersion(app.versionInfo, tasks)
+      TaskStatsByVersion(app.versionInfo, tasksForStats)
     }
 
-    lazy val enrichedTasksFuture: Future[Seq[EnrichedTask]] = {
+    lazy val enrichedTasks: Seq[EnrichedTask] = {
       log.debug(s"assembling rich tasks for app [${app.id}]")
-      def statusesToEnrichedTasks(instances: Seq[Instance], statuses: Map[Instance.Id, collection.Seq[Health]]): Seq[EnrichedTask] = {
+      def statusesToEnrichedTasks(instances: Vector[Instance], statuses: Map[Instance.Id, collection.Seq[Health]]): Seq[EnrichedTask] = {
         instances.map { instance =>
           EnrichedTask(instance, instance.appTask, statuses.getOrElse(instance.instanceId, Nil).to[Seq])
         }
       }
-
-      for {
-        instances: Seq[Instance] <- instancesFuture
-        statuses <- healthByInstanceIdFuture
-      } yield statusesToEnrichedTasks(instances, statuses)
-    }.recover {
-      case NonFatal(e) => throw new RuntimeException(s"while assembling rich tasks for app [${app.id}]", e)
+      statusesToEnrichedTasks(instances, healthByInstance)
+      //case NonFatal(e) => throw new RuntimeException(s"while assembling rich tasks for app [${app.id}]", e)
     }
 
     lazy val maybeLastTaskFailureFuture: Future[Option[TaskFailure]] = {
